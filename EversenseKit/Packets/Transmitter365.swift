@@ -61,7 +61,7 @@ extension Eversense365 {
     private static func getRecentGlucose(peripheralManager: PeripheralManager) -> GetGlucoseDataResponse? {
         do {
             let response: GetGlucoseDataResponse = try peripheralManager.write(GetGlucoseDataPacket())
-            guard response.glucoseInMgDl < 0x03E8 else {
+            guard response.glucoseInMgDl < 0x01C2 else {
                 let message =
                     "Invalid Glucose data - value: \(response.glucoseInMgDl) mg/dl, timestamp: \(response.glucoseDatetime)"
                 logger.warning(message)
@@ -152,7 +152,7 @@ extension Eversense365 {
             logger.debug("Sending GetActiveAlarmsPacket")
             let alarmsRequest = GetActiveAlarmsPacket(currentGlucose: cgmManager.state.recentGlucoseInMgDl ?? 0)
             let activeAlarms: GetActiveAlarmsResponse = try peripheralManager.write(alarmsRequest)
-            cgmManager.state.activeAlarms = activeAlarms.alarms
+            cgmManager.handleAlarm(alarms: activeAlarms.alarms)
 
             logger.info("[365] Sync completed - timestamp: \(Date.now)")
 

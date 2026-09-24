@@ -23,6 +23,7 @@ class PeripheralManager: NSObject {
     private var writeQueue: EversenseKitDispatchGroup?
     private let writeSemaphore = DispatchSemaphore(value: 1)
     private var writeResponse: AnyObject?
+    private var isCleaningUp = false
 
     private let maxPacketSize: Int
 
@@ -39,26 +40,59 @@ class PeripheralManager: NSObject {
         self.peripheral.delegate = self
     }
 
+    // Kept separate from CoreBluetooth so framing can be tested without a peripheral.
+    // Returns true when the buffer is ready for the existing decode/dispatch path.
+    static func appendReceivedChunk(_ data: Data, to buffer: inout Data, isE3: Bool) -> Bool {
+        guard !data.isEmpty else {
+            return false
+        }
+
+        if isE3 {
+            buffer.append(data)
+        } else {
+            let headerLength = buffer.isEmpty ? 3 : 2
+            guard data.count >= headerLength else {
+                buffer = Data()
+                return false
+            }
+            buffer.append(data.subdata(in: headerLength ..< data.count))
+        }
+
+        guard !buffer.isEmpty else {
+            return false
+        }
+        return isE3 || data[0] == data[1]
+    }
+
+    static func matchesNotification(_ data: Data, pushId: Eversense365.PushIds) -> Bool {
+        data.count >= 2 && data[0] == Eversense365.PacketIds.NotificationId.rawValue && data[1] == pushId.rawValue
+    }
+
     func cleanup() {
+        isCleaningUp = true
+        writeSemaphore.signal()
         if let writeAction = writeQueue {
             writeAction.leave()
         }
     }
 
     func write<T>(_ packet: any BasePacket, timeout: TimeInterval = .seconds(5)) throws -> T {
+        if isCleaningUp {
+            throw NSError(domain: "PeripheralManager cleaned up", code: -1)
+        }
         // Wait until previous write calls have been completed
-        self.writeSemaphore.wait()
-        
+        writeSemaphore.wait()
+
         guard let characteristic = requestCharacteristic else {
-            self.logger.error("Not connected anymore...")
+            logger.error("Not connected anymore...", type: .send)
             throw NSError(domain: "Not connected anymore...", code: 0, userInfo: nil)
         }
-        
+
         defer {
             writeSemaphore.signal()
             writeResponse = nil
         }
-        
+
         self.packet = packet
         let writeQ = EversenseKitDispatchGroup()
         writeQ.enter()
@@ -67,13 +101,13 @@ class PeripheralManager: NSObject {
 
         let data = packet.getRequestData()
         if case cgmManager.state.security = .none {
-            logger.debug("[RAW] Writing data -> \(data.hexString())")
+            logger.debug("[RAW] Writing data -> \(data.hexString())", type: .send)
             peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
         } else {
             let encodedMessage = EncodingOperations.encode(data: data, chunkSize: maxPacketSize)
 
             for message in EncodingOperations.split(data: encodedMessage, chunkSize: maxPacketSize) {
-                logger.debug("[ENCODED] Writing data -> \(message.hexString())")
+                logger.debug("[ENCODED] Writing data -> \(message.hexString())", type: .send)
 
                 peripheral.writeValue(message, for: characteristic, type: .withoutResponse)
                 Thread.sleep(forTimeInterval: .milliseconds(100))
@@ -193,47 +227,40 @@ extension PeripheralManager: CBPeripheralDelegate {
 
     func peripheral(_: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
-            logger.error("Received error on value update: \(error.localizedDescription)")
+            logger.error("Received error on value update: \(error.localizedDescription)", type: .receive)
             connectCompletion?(ConnectFailure.unknown(reason: "Received error on value update: \(error.localizedDescription)"))
             return
         }
 
         guard let data = characteristic.value else {
-            logger.warning("Empty data received")
+            logger.warning("Empty data received", type: .receive)
             return
         }
 
         let isE3 = cgmManager.state.security == .none
-        if isE3 {
-            buffer.append(data)
-        } else {
-            buffer.append(data.subdata(in: (buffer.isEmpty ? 3 : 2) ..< data.count))
+        guard Self.appendReceivedChunk(data, to: &buffer, isE3: isE3) else {
+            return
         }
         var actualData = Data(buffer)
 
         if !isE3 {
-            if data[0] != data[1] {
-                // Data is chuncked, lets store this and wait
-                return
-            }
-
             if buffer[0] != Eversense365.PacketIds.AuthenticateV2ResponseId.rawValue {
                 // Only decrypt if packet is not for Authentication
                 actualData = CryptoUtil.shared.decrypt(data: actualData)
                 guard !actualData.isEmpty else {
-                    logger.error("Failed to decrypt payload")
+                    logger.error("Failed to decrypt payload", type: .receive)
                     buffer = Data()
                     return
                 }
             }
         }
 
-        logger.debug("Decrypted payload: \(actualData.hexString())")
+        logger.debug("Decrypted payload: \(actualData.hexString())", type: .receive)
         buffer = Data()
 
         if actualData[0] == EversenseE3.PacketIds.keepAlivePush.rawValue {
             // TODO: Detect alarm notification
-            logger.debug("[E3] Got keep alive message")
+            logger.debug("[E3] Got keep alive message", type: .receive)
 
             if cgmManager.state.recentGlucoseDateTime == nil || cgmManager.state.recentGlucoseDateTime!
                 .addingTimeInterval(.minutes(4.5)) > Date.now
@@ -246,13 +273,14 @@ extension PeripheralManager: CBPeripheralDelegate {
             return
         }
 
-        if actualData[0] == Eversense365.PacketIds.NotificationId.rawValue,
-           actualData[1] == Eversense365.PushIds.KeepAlive.rawValue
-        {
+        if Self.matchesNotification(actualData, pushId: .KeepAlive) {
             let packet = Eversense365.PushKeepAlivePacket()
             let response = packet.parseResponse(data: actualData)
 
-            logger.debug("[365] Got keep alive message - mostRecentGlucoseDatetime: \(response.mostRecenteGlucoseDatetime)")
+            logger.debug(
+                "[365] Got keep alive message - mostRecentGlucoseDatetime: \(response.mostRecenteGlucoseDatetime)",
+                type: .receive
+            )
             if response.mostRecenteGlucoseDatetime > (cgmManager.state.recentGlucoseDateTime ?? .distantPast) {
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self = self else { return }
@@ -263,13 +291,11 @@ extension PeripheralManager: CBPeripheralDelegate {
             return
         }
 
-        if actualData[0] == Eversense365.PacketIds.NotificationId.rawValue,
-           actualData[1] == Eversense365.PushIds.AlarmWithData.rawValue
-        {
+        if Self.matchesNotification(actualData, pushId: .AlarmWithData) {
             let packet = Eversense365.PushAlarmWithDataPacket(currentGlucose: cgmManager.state.recentGlucoseInMgDl ?? 0)
             let response = packet.parseResponse(data: actualData)
             guard response.alarm.code != .unknown else {
-                logger.warning("[365] Received unknown alarm: \(response.alarm.codeRaw)")
+                logger.warning("[365] Received unknown alarm: \(response.alarm.codeRaw)", type: .receive)
                 return
             }
 
@@ -278,7 +304,7 @@ extension PeripheralManager: CBPeripheralDelegate {
                 self.cgmManager.notifyStateDidChange()
             }
 
-            logger.debug("[365] Received alarm")
+            logger.debug("[365] Received alarm", type: .receive)
             return
         }
 
@@ -286,7 +312,7 @@ extension PeripheralManager: CBPeripheralDelegate {
             EversenseE3.handleError(data: actualData)
 
             guard let stream = writeQueue else {
-                logger.warning("No pending writeQueue")
+                logger.warning("No pending writeQueue", type: .receive)
                 return
             }
 
@@ -298,7 +324,7 @@ extension PeripheralManager: CBPeripheralDelegate {
             Eversense365.handleError(data: actualData)
 
             guard let stream = writeQueue else {
-                logger.warning("No pending writeQueue")
+                logger.warning("No pending writeQueue", type: .receive)
                 return
             }
 
@@ -308,13 +334,16 @@ extension PeripheralManager: CBPeripheralDelegate {
 
         // From here we assume it is a normal packet
         guard let packet = self.packet else {
-            logger.error("No active packet - data: \(actualData.hexString())")
+            logger.error("No active packet - data: \(actualData.hexString())", type: .receive)
             return
         }
 
         guard packet.checkPacket(data: actualData, doChecksum: isE3) else {
             logger
-                .warning("Received invalid response, invalid response code or checksum failed - data: \(actualData.hexString())")
+                .warning(
+                    "Received invalid response, invalid response code or checksum failed - data: \(actualData.hexString())",
+                    type: .receive
+                )
             return
         }
 
@@ -325,7 +354,7 @@ extension PeripheralManager: CBPeripheralDelegate {
         writeResponse = packet.parseResponse(data: actualData) as AnyObject
 
         guard let stream = writeQueue else {
-            logger.warning("No pending writeQueue - data: \(actualData.hexString())")
+            logger.warning("No pending writeQueue - data: \(actualData.hexString())", type: .receive)
             return
         }
 
@@ -373,8 +402,7 @@ extension PeripheralManager {
         do {
             if cgmManager.state.certificateV2 == nil {
                 guard
-                    let username = cgmManager.state.username,
-                    let password = cgmManager.state.password,
+                    let credentials = cgmManager.keychain.getEversenseCredentials(),
                     let publicKey = cgmManager.state.publicKeyV2
                 else {
                     logger.error("Missing credentials...")
@@ -386,9 +414,14 @@ extension PeripheralManager {
                 let whoAmIResponse: Eversense365.AuthWhoAmIResponse =
                     try write(Eversense365.AuthWhoAmIPacket(secret: clientId))
 
-                let accessResponse = try await AuthenticationApi.login(username: username, password: password)
+                let accessResponse = try await AuthenticationApi.login(
+                    cgmManager: cgmManager,
+                    username: credentials.username,
+                    password: credentials.password
+                )
 
                 let fleetSecret = await KeyVaultApi.getFleetSecretV2(
+                    cgmManager: cgmManager,
                     accessToken: accessResponse.accessToken,
                     serialNumber: whoAmIResponse.serialNumber.base64Safe(),
                     nonce: whoAmIResponse.nonce.base64Safe(),

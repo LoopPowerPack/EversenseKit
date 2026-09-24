@@ -1,8 +1,6 @@
 import LoopKit
 
 enum DMSApi {
-    private static let careBaseUrl = "https://usapialpha.eversensedms.com/"
-
     private static let logger = EversenseLogger(category: "DMSApi")
 
     private static let dateFormatter: DateFormatter = {
@@ -13,7 +11,7 @@ enum DMSApi {
     }()
 
     static func uploadCurrentValues(cgmManager: EversenseCGMManager, reading: CGMReading) async -> Bool {
-        guard let url = URL(string: "\(careBaseUrl)api/care/PutCurrentValues") else {
+        guard let url = URL(string: "\(cgmManager.state.apiZone.careUrl)api/care/PutCurrentValues") else {
             logger.error("Could not create URL...")
             return false
         }
@@ -39,11 +37,13 @@ enum DMSApi {
             request.httpBody = try JSONEncoder().encode(message)
 
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let response = response as? HTTPURLResponse, response.statusCode < 400 else {
-                let message =
-                    "Got invalid response from PutCurrentValues: \((response as? HTTPURLResponse)?.statusCode ?? -1) \(String(data: data, encoding: .utf8) ?? "No data")"
+            logger
+                .info(
+                    "Server response PutCurrentValues: \((response as? HTTPURLResponse)?.statusCode ?? -1), data: \(String(data: data, encoding: .utf8) ?? "No data")"
+                )
 
-                logger.error(message)
+            guard let response = response as? HTTPURLResponse, response.statusCode < 400 else {
+                logger.error("Got invalid response from PutCurrentValues")
                 return false
             }
 
@@ -61,7 +61,7 @@ enum DMSApi {
         calibrations: [CalibrationEvent],
         alerts: [ActiveAlarm]
     ) async -> Bool {
-        guard let url = URL(string: "\(careBaseUrl)api/care/PutDeviceEvents") else {
+        guard let url = URL(string: "\(cgmManager.state.apiZone.careUrl)api/care/PutDeviceEvents") else {
             logger.error("Could not create URL...")
             return false
         }
@@ -95,11 +95,12 @@ enum DMSApi {
             request.httpBody = try JSONEncoder().encode(message)
 
             let (data, response) = try await URLSession.shared.data(for: request)
+            logger
+                .info(
+                    "Server response PutDeviceEvents: \((response as? HTTPURLResponse)?.statusCode ?? -1), data: \(String(data: data, encoding: .utf8) ?? "No data")"
+                )
             guard let response = response as? HTTPURLResponse, response.statusCode < 400 else {
-                let message =
-                    "Got invalid response from PutDeviceEvents: \((response as? HTTPURLResponse)?.statusCode ?? -1) \(String(data: data, encoding: .utf8) ?? "No data")"
-
-                logger.error(message)
+                logger.error("Got invalid response from PutDeviceEvents")
                 return false
             }
 
@@ -116,12 +117,13 @@ enum DMSApi {
         }
 
         do {
-            guard let urlFollowers = URL(string: "\(careBaseUrl)api/care/GetMyFollowerPatientList") else {
+            guard let urlFollowers = URL(string: "\(cgmManager.state.apiZone.careUrl)api/care/GetMyFollowerPatientList") else {
                 logger.error("Could not create follower URL...")
                 return []
             }
 
-            guard let urlPending = URL(string: "\(careBaseUrl)api/care/GetMyPendingFollowerPatientList") else {
+            guard let urlPending = URL(string: "\(cgmManager.state.apiZone.careUrl)api/care/GetMyPendingFollowerPatientList")
+            else {
                 logger.error("Could not create URL...")
                 return []
             }
@@ -181,7 +183,7 @@ enum DMSApi {
 
         guard let url =
             URL(
-                string: "\(careBaseUrl)api/care/PutVerificationCode_V2?SenderEmail=\(email)&ReferenceName=\(fullName)&LangCode=en"
+                string: "\(cgmManager.state.apiZone.careUrl)api/care/PutVerificationCode_V2?SenderEmail=\(email)&ReferenceName=\(fullName)&LangCode=en"
             )
         else {
             logger.error("Could not create URL...")
@@ -212,7 +214,8 @@ enum DMSApi {
             return
         }
 
-        guard let url = URL(string: "\(careBaseUrl)api/care/UpdateStatus?FollowerEmail=\(email)&Status=2") else {
+        guard let url = URL(string: "\(cgmManager.state.apiZone.careUrl)api/care/UpdateStatus?FollowerEmail=\(email)&Status=2")
+        else {
             logger.error("Could not create URL...")
             return
         }
@@ -244,13 +247,17 @@ enum DMSApi {
             return accessToken
         }
 
-        guard let username = cgmManager.state.username, let password = cgmManager.state.password else {
+        guard let credentials = cgmManager.keychain.getEversenseCredentials() else {
             logger.error("User not logged in...")
             return nil
         }
 
         do {
-            let response = try await AuthenticationApi.login(username: username, password: password)
+            let response = try await AuthenticationApi.login(
+                cgmManager: cgmManager,
+                username: credentials.username,
+                password: credentials.password
+            )
             cgmManager.state.accessToken = response.accessToken
             cgmManager.state.accessTokenExpiration = Date.now.addingTimeInterval(.seconds(Double(response.expiresIn)))
             cgmManager.notifyStateDidChange()

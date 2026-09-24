@@ -217,7 +217,6 @@ struct TransmitterSettingsView: View {
             .padding([.bottom, .horizontal])
             .disabled(viewModel.loading)
         }
-        .navigationBarTitle(String(localized: "Transmitter settings", comment: "Title for user options"))
     }
 
     @ViewBuilder private func toggleRow(label: Text, hint: Text, value: Binding<Bool>) -> some View {
@@ -297,8 +296,10 @@ struct TransmitterSettingsView: View {
                         labelValue
                             .foregroundStyle(statePicker.wrappedValue ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
                         Spacer()
-                        Text(displayGlucosePreference.format(viewModel.toHkQuantity(valueValue.wrappedValue)))
-                            .foregroundStyle(statePicker.wrappedValue ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                        Text(
+                            displayGlucosePreference.format(viewModel.toHkQuantity(valueValue.wrappedValue))
+                        )
+                        .foregroundStyle(statePicker.wrappedValue ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                     }
                     .onTapGesture {
                         statePicker.wrappedValue.toggle()
@@ -363,8 +364,11 @@ struct TransmitterSettingsView: View {
                         labelThreshold
                             .foregroundStyle(stateThresholdPicker.wrappedValue ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
                         Spacer()
-                        Text(displayGlucosePreference.format(viewModel.toHkQuantity(valueThreshold.wrappedValue)))
-                            .foregroundStyle(stateThresholdPicker.wrappedValue ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                        Text(
+                            displayGlucosePreference
+                                .format(viewModel.toHkQuantity(valueThreshold.wrappedValue))
+                        )
+                        .foregroundStyle(stateThresholdPicker.wrappedValue ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                     }
                     .onTapGesture {
                         stateThresholdPicker.wrappedValue.toggle()
